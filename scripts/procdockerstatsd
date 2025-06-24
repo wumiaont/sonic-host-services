@@ -12,7 +12,8 @@ import sys
 import time
 from datetime import datetime, timedelta
 
-from sonic_py_common import daemon_base
+from sonic_py_common import daemon_base, device_info
+from swsscommon.swsscommon import ConfigDBConnector, DBConnector, Table, SonicDBConfig
 from swsscommon import swsscommon
 from sonic_py_common.general import getstatusoutput_noshell_pipe, getstatusoutput_noshell
 
@@ -30,6 +31,20 @@ class ProcDockerStats(daemon_base.DaemonBase):
         super(ProcDockerStats, self).__init__(log_identifier)
         self.state_db = swsscommon.SonicV2Connector(host=REDIS_HOSTIP)
         self.state_db.connect("STATE_DB")
+        self.is_multi_npu = device_info.is_multi_npu()
+        self.ns_state_db = {}
+        self.ns_fips_state_tbl = {}
+        if self.is_multi_npu:
+            SonicDBConfig.initializeGlobalConfig()
+            namespaces = device_info.get_namespaces()
+            for ns in namespaces:
+                #Connect to ConfigDB in each namespace
+                self.ns_state_db[ns] = ConfigDBConnector(namespace=ns)
+                self.ns_state_db[ns].connect(wait_for_init=True, retry_on=True)
+
+                #Connect to stateDB in each namespace
+                db_conn = DBConnector("STATE_DB", 0, False, ns)
+                self.ns_fips_state_tbl[ns] = Table(db_conn, "FIPS_STATS")
 
     def run_command(self, cmd):
         proc = subprocess.Popen(cmd, universal_newlines=True, stdout=subprocess.PIPE)
@@ -217,11 +232,15 @@ class ProcDockerStats(daemon_base.DaemonBase):
         # Check if FIPS runtime status
         exitcode, _ = getstatusoutput_noshell_pipe(['sudo', 'openssl', 'engine', '-vv'], ['grep', '-i', 'symcryp'])
         enabled = not any(exitcode)
-        update_value = {}
-        update_value['timestamp'] = datetime.utcnow().isoformat()
-        update_value['enforced'] = str(enforced)
-        update_value['enabled'] = str(enabled)
-        self.batch_update_state_db(fips_db_key, update_value)
+
+        self.update_state_db(fips_db_key, 'timestamp', datetime.utcnow().isoformat())
+        self.update_state_db(fips_db_key, 'enforced', str(enforced))
+        self.update_state_db(fips_db_key, 'enabled', str(enabled))
+        # Update the FIPS state to STATE_DB in namespaces in multi-asic platform
+        for ns, tbl in self.ns_fips_state_tbl.items():
+            tbl.set("state", [('timestamp', datetime.utcnow().isoformat())])
+            tbl.set("state", [('enforced', str(enforced))])
+            tbl.set("state", [('enabled', str(enabled))])
 
     def update_state_db(self, key1, key2, value2):
         self.state_db.set('STATE_DB', key1, key2, value2)
